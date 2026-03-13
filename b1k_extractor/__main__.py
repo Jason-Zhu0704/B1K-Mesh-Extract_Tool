@@ -186,6 +186,8 @@ def main() -> None:
         action="store_true",
         help="Re-extract assets even if already in index",
     )
+    parser.add_argument(
+        "--list-categories",
         action="store_true",
         help="Print available categories and exit",
     )
