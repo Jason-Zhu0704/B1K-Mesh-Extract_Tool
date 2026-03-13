@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "b1k-mesh-extractor"
+version = "0.1.0"
+description = "Convert BEHAVIOR-1K encrypted USD assets to Drake-ready mesh files (OBJ/GLB/STL)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "trimesh>=4.0",
+]
+
+[project.optional-dependencies]
+# Install Drake separately: pip install drake
+drake = ["drake>=1.26"]
+dev = ["pytest>=7", "trimesh>=4.0", "numpy>=1.24"]
+
+[project.scripts]
+b1k-extract = "b1k_extractor.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["b1k_extractor*"]

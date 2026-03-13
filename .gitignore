@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+
+# Extracted mesh output — DO NOT commit (derived from proprietary B1K assets)
+b1k_meshes/
+b1k_drake_assets/
+objects/
+index.json
+*.obj
+*.stl
+*.glb
+*.ply
+*.gltf
+
+# B1K dataset files (proprietary)
+*.encrypted.usd
+*.usd
+*.usdc
+*.usda
+omnigibson.key
+
+# IDE / tools
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
