@@ -88,7 +88,7 @@ class AssetExtractor:
         USD stage accumulation across batches.
         """
         import omnigibson as og
-        from omnigibson.macros import gm
+        from omnigibson.macros import gm, unlocked
 
         for batch_start in range(0, len(assets), batch_size):
             batch = assets[batch_start: batch_start + batch_size]
@@ -105,11 +105,13 @@ class AssetExtractor:
                     "visual_only": True,
                 })
 
-            gm.HEADLESS = True
-            gm.USE_GPU_DYNAMICS = False
-            gm.ENABLE_FLATCACHE = False
-            gm.ENABLE_OBJECT_STATES = True
-            gm.RENDER_VIEWER_CAMERA = False
+            # Use unlocked() so macros can be set on every batch restart
+            with unlocked():
+                gm.HEADLESS = True
+                gm.USE_GPU_DYNAMICS = False
+                gm.ENABLE_FLATCACHE = False
+                gm.ENABLE_OBJECT_STATES = True
+                gm.RENDER_VIEWER_CAMERA = False
 
             env = og.Environment(
                 configs={"scene": {"type": "Scene"}, "objects": objects_cfg}
