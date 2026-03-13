@@ -46,6 +46,164 @@ def _body_local_transform(
     return root_world_inv @ prim_world
 
 
+# ── subprocess worker (runs in a fresh OmniGibson process per batch) ─────────
+
+def _batch_worker(batch: list[tuple[str, str]], queue) -> None:
+    """Worker executed in a subprocess: load one OmniGibson env, extract batch.
+
+    Results are put into *queue* as a list of ExtractionResult objects.
+    OmniGibson is only ever imported inside this function — never in the
+    parent process — so each batch gets a completely clean Isaac Sim instance.
+    """
+    import os
+    import logging as _logging
+    os.environ.setdefault("ACCEPT_EULA", "Y")
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    _log = _logging.getLogger(__name__)
+
+    import omnigibson as og
+    from omnigibson.macros import gm
+
+    objects_cfg = [
+        {
+            "type": "DatasetObject",
+            "name": f"x{cat}_{model}",
+            "category": cat,
+            "model": model,
+            "position": [0, 0, 0],
+            "visual_only": True,
+        }
+        for cat, model in batch
+    ]
+
+    with gm.unlocked():
+        gm.HEADLESS = True
+        gm.USE_GPU_DYNAMICS = False
+        gm.ENABLE_FLATCACHE = False
+        gm.ENABLE_OBJECT_STATES = True
+        gm.RENDER_VIEWER_CAMERA = False
+
+    results = []
+    try:
+        env = og.Environment(
+            configs={"scene": {"type": "Scene"}, "objects": objects_cfg}
+        )
+        og.sim.step()
+
+        for cat, model in batch:
+            obj_name = f"x{cat}_{model}"
+            obj = env.scene.object_registry("name", obj_name)
+            if obj is None:
+                _log.warning(f"  object not found in registry: {obj_name}")
+                results.append(ExtractionResult(cat, model, None, None))
+                continue
+            try:
+                results.append(_extract_from_stage(obj, cat, model))
+            except Exception as exc:
+                _log.error(f"  extraction failed for {cat}/{model}: {exc}")
+                results.append(ExtractionResult(cat, model, None, None))
+    except Exception as exc:
+        _log.error(f"  batch env creation failed: {exc}")
+        for cat, model in batch:
+            results.append(ExtractionResult(cat, model, None, None))
+    finally:
+        try:
+            og.sim.stop()
+        except Exception:
+            pass
+
+    queue.put(results)
+
+
+def _extract_from_stage(obj, category: str, model: str) -> "ExtractionResult":
+    """Read geometry from the live USD stage for the given object prim."""
+    import omnigibson as og
+    from pxr import Usd, UsdGeom
+    import trimesh
+    import trimesh.util as tutil
+
+    logger.info(f"  extracting {category}/{model} …")
+
+    stage = og.sim.stage
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    root_prim = stage.GetPrimAtPath(obj.prim_path)
+
+    root_world = np.array(
+        xform_cache.GetLocalToWorldTransform(root_prim)
+    ).reshape(4, 4)
+    root_world_inv = np.linalg.inv(root_world)
+
+    visual_meshes: list = []
+    collision_meshes: list = []
+
+    for prim in Usd.PrimRange(root_prim):
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+
+        prim_path_str = str(prim.GetPath()).lower()
+        is_collision = "collision" in prim_path_str
+
+        if not is_collision:
+            img = UsdGeom.Imageable(prim)
+            vis_attr = img.GetVisibilityAttr()
+            if vis_attr.HasValue() and vis_attr.Get() == UsdGeom.Tokens.invisible:
+                continue
+
+        mg = UsdGeom.Mesh(prim)
+        pts_attr = mg.GetPointsAttr()
+        if not pts_attr.HasValue():
+            continue
+        pts = pts_attr.Get()
+        if pts is None or len(pts) == 0:
+            continue
+
+        fi_attr = mg.GetFaceVertexIndicesAttr()
+        fc_attr = mg.GetFaceVertexCountsAttr()
+        if not fi_attr.HasValue() or not fc_attr.HasValue():
+            continue
+
+        pts = np.array(pts, dtype=np.float64)
+        fi = np.array(fi_attr.Get())
+        fc = np.array(fc_attr.Get())
+        faces = _triangulate(fi, fc)
+        if len(faces) == 0:
+            continue
+
+        local2body = _body_local_transform(
+            xform_cache, root_prim, prim, root_world_inv
+        )
+        tm = trimesh.Trimesh(vertices=pts, faces=faces, process=False)
+        tm.apply_transform(local2body)
+
+        if is_collision:
+            collision_meshes.append(tm)
+        else:
+            visual_meshes.append(tm)
+
+    visual = tutil.concatenate(visual_meshes) if visual_meshes else None
+
+    if collision_meshes:
+        collision_hull = tutil.concatenate(collision_meshes).convex_hull
+    elif visual_meshes:
+        collision_hull = tutil.concatenate(visual_meshes).convex_hull
+    else:
+        collision_hull = None
+
+    n_vis = sum(len(m.vertices) for m in visual_meshes)
+    n_col = len(collision_hull.vertices) if collision_hull else 0
+    logger.info(
+        f"    → {len(visual_meshes)} vis submesh(es) {n_vis}v,"
+        f" collision hull {n_col}v"
+    )
+    return ExtractionResult(
+        category=category, model=model,
+        visual=visual, collision_hull=collision_hull,
+    )
+
+
 # ── per-asset extraction ─────────────────────────────────────────────────────
 
 class AssetExtractor:
@@ -83,144 +241,30 @@ class AssetExtractor:
     ):
         """Yield ExtractionResult for each (category, model) pair.
 
-        Loads *batch_size* assets per OmniGibson session to amortise the
-        ~25 s startup cost.  Each batch opens a fresh env so there is no
-        USD stage accumulation across batches.
+        Spawns one subprocess per batch of *batch_size* assets.  Each
+        subprocess launches a fresh OmniGibson/Isaac Sim instance, so
+        there is no singleton state leakage between batches.
         """
-        import omnigibson as og
-        from omnigibson.macros import gm
+        import multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
 
         for batch_start in range(0, len(assets), batch_size):
             batch = assets[batch_start: batch_start + batch_size]
-
-            # Build cfg with all assets in this batch
-            objects_cfg = []
-            for cat, model in batch:
-                objects_cfg.append({
-                    "type": "DatasetObject",
-                    "name": f"x{cat}_{model}",
-                    "category": cat,
-                    "model": model,
-                    "position": [0, 0, 0],
-                    "visual_only": True,
-                })
-
-            # Use gm.unlocked() so macros can be set on every batch restart
-            with gm.unlocked():
-                gm.HEADLESS = True
-                gm.USE_GPU_DYNAMICS = False
-                gm.ENABLE_FLATCACHE = False
-                gm.ENABLE_OBJECT_STATES = True
-                gm.RENDER_VIEWER_CAMERA = False
-
-            env = og.Environment(
-                configs={"scene": {"type": "Scene"}, "objects": objects_cfg}
-            )
-            og.sim.step()
-
+            queue = ctx.Queue()
+            proc = ctx.Process(target=_batch_worker, args=(batch, queue))
+            proc.start()
             try:
-                for cat, model in batch:
-                    obj_name = f"x{cat}_{model}"
-                    obj = env.scene.object_registry("name", obj_name)
-                    if obj is None:
-                        logger.warning(f"  object not found in registry: {obj_name}")
-                        yield ExtractionResult(cat, model, None, None)
-                        continue
-                    try:
-                        yield AssetExtractor._extract_from_stage(obj, cat, model)
-                    except Exception as e:
-                        logger.error(f"  extraction failed for {cat}/{model}: {e}")
-                        yield ExtractionResult(cat, model, None, None)
+                results = queue.get(timeout=600)  # 10 min max per batch
+            except Exception as exc:
+                logger.error(f"  batch {batch_start}–{batch_start+len(batch)} failed: {exc}")
+                results = [ExtractionResult(cat, model, None, None) for cat, model in batch]
             finally:
-                env.close()
-                og.sim.stop()
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _extract_from_stage(obj, category: str, model: str) -> "ExtractionResult":
-        """Read geometry from the live USD stage for the given object prim."""
-        import omnigibson as og
-        from pxr import Usd, UsdGeom
-        import trimesh
-
-        logger.info(f"  extracting {category}/{model} …")
-
-        stage = og.sim.stage
-        xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-        root_prim = stage.GetPrimAtPath(obj.prim_path)
-
-        root_world = np.array(
-            xform_cache.GetLocalToWorldTransform(root_prim)
-        ).reshape(4, 4)
-        root_world_inv = np.linalg.inv(root_world)
-
-        visual_meshes: list = []
-        collision_meshes: list = []
-
-        for prim in Usd.PrimRange(root_prim):
-            if not prim.IsA(UsdGeom.Mesh):
-                continue
-
-            prim_path_str = str(prim.GetPath()).lower()
-            is_collision = "collision" in prim_path_str
-
-            if not is_collision:
-                img = UsdGeom.Imageable(prim)
-                vis_attr = img.GetVisibilityAttr()
-                if vis_attr.HasValue() and vis_attr.Get() == UsdGeom.Tokens.invisible:
-                    continue
-
-            mg = UsdGeom.Mesh(prim)
-            pts_attr = mg.GetPointsAttr()
-            if not pts_attr.HasValue():
-                continue
-            pts = pts_attr.Get()
-            if pts is None or len(pts) == 0:
-                continue
-
-            fi_attr = mg.GetFaceVertexIndicesAttr()
-            fc_attr = mg.GetFaceVertexCountsAttr()
-            if not fi_attr.HasValue() or not fc_attr.HasValue():
-                continue
-
-            pts = np.array(pts, dtype=np.float64)
-            fi = np.array(fi_attr.Get())
-            fc = np.array(fc_attr.Get())
-            faces = _triangulate(fi, fc)
-            if len(faces) == 0:
-                continue
-
-            local2body = _body_local_transform(
-                xform_cache, root_prim, prim, root_world_inv
-            )
-            tm = trimesh.Trimesh(vertices=pts, faces=faces, process=False)
-            tm.apply_transform(local2body)
-
-            if is_collision:
-                collision_meshes.append(tm)
-            else:
-                visual_meshes.append(tm)
-
-        import trimesh.util as tutil
-        visual = tutil.concatenate(visual_meshes) if visual_meshes else None
-
-        if collision_meshes:
-            collision_hull = tutil.concatenate(collision_meshes).convex_hull
-        elif visual_meshes:
-            collision_hull = tutil.concatenate(visual_meshes).convex_hull
-        else:
-            collision_hull = None
-
-        n_vis = sum(len(m.vertices) for m in visual_meshes)
-        n_col = len(collision_hull.vertices) if collision_hull else 0
-        logger.info(
-            f"    → {len(visual_meshes)} vis submesh(es) {n_vis}v,"
-            f" collision hull {n_col}v"
-        )
-        return ExtractionResult(
-            category=category, model=model,
-            visual=visual, collision_hull=collision_hull,
-        )
+                proc.join(timeout=30)
+                if proc.is_alive():
+                    proc.kill()
+            for r in results:
+                yield r
 
 
 # ── result container ─────────────────────────────────────────────────────────
