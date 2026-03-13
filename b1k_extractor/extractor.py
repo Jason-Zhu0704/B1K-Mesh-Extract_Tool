@@ -133,6 +133,7 @@ class AssetExtractor:
                         yield ExtractionResult(cat, model, None, None)
             finally:
                 env.close()
+                og.sim.stop()
 
     # ------------------------------------------------------------------
     @staticmethod
